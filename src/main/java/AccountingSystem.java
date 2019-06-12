@@ -1,14 +1,28 @@
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AccountingSystem implements AccountingSystemInterface {
 
-    private ConcurrentHashMap<String, PhoneAndTime> registeredPhones;
+    private ConcurrentHashMap<String, Account> registeredPhones;
     private ConcurrentHashMap<String, String> currentConnections;
+
+    private List<String> awaitingCalls = Collections.synchronizedList(new ArrayList<>());
 
     private ExecutorService executorService;
 
-    private final Object lock;
+    private ExecutorService automaticDisconnectionService;
+
+    private final Object lock1;
+    private final Object lock2;
 
     public AccountingSystem() {
         this.registeredPhones = new ConcurrentHashMap<>();
@@ -16,12 +30,16 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         this.executorService = Executors.newFixedThreadPool(100);
 
-        this.lock = new Object();
+        this.automaticDisconnectionService = Executors.newFixedThreadPool(100);
+
+        this.lock1 = new Object();
+        this.lock2 = new Object();
+
     }
 
     @Override
     public void phoneRegistration(String number, PhoneInterface phone) {
-        this.registeredPhones.putIfAbsent(number, new PhoneAndTime(phone));
+        this.registeredPhones.putIfAbsent(number, new Account(phone));
     }
 
     @Override
@@ -43,48 +61,61 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public boolean connection(String numberFrom, String numberTo) {
-        synchronized (this.lock) {
+        synchronized (this.lock2) {
             if (!this.registeredPhones.containsKey(numberFrom) || !this.registeredPhones.containsKey(numberTo))
                 return false;
 
             if (!this.registeredPhones.get(numberFrom).getRemainingTime().isPresent() || this.registeredPhones.get(numberFrom).getRemainingTime().get() < 0L)
                 return false;
         }
+        Future<Boolean> fromCallResult = null;
 
-        if (!this.currentConnections.containsKey(numberTo) && !this.currentConnections.containsValue(numberTo)) {
-            Callable<Boolean> fromCall = () -> {
-                System.out.println("Supplying connection from " + numberFrom + " to :" + numberTo);
-                return this.registeredPhones.get(numberFrom).getPhone().newConnection(numberTo);
-            };
-            Callable<Boolean> toCall = () -> {
-                System.out.println("Supplying connection from " + numberFrom + " to :" + numberTo);
-                return this.registeredPhones.get(numberTo).getPhone().newConnection(numberFrom);
-            };
+        synchronized (this.lock1) {
+            if (!this.currentConnections.containsKey(numberTo) && !this.currentConnections.containsValue(numberTo)) {
+                Callable<Boolean> fromCall = () -> this.registeredPhones.get(numberTo).getPhone().newConnection(numberFrom);
+                if (awaitingCalls.contains(numberTo) || awaitingCalls.contains(numberFrom))
+                    return false;
 
-            Future<Boolean> fromCallResult = executorService.submit(fromCall);
-            Future<Boolean> toCallResult = executorService.submit(toCall);
-
-            try {
-                if (fromCallResult.get() && toCallResult.get()) {
-                    synchronized (this) {
-                        if (!this.currentConnections.containsKey(numberTo) &&
-                                !this.currentConnections.containsValue(numberTo) &&
-                                !this.currentConnections.containsKey(numberFrom) &&
-                                !this.currentConnections.containsValue(numberFrom)
-                        )
-                            this.currentConnections.put(numberFrom, numberTo);
-                    }
-                }
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
+                fromCallResult = executorService.submit(fromCall);
+                awaitingCalls.add(numberFrom);
+                awaitingCalls.add(numberTo);
             }
+        }
+
+        try {
+            if (fromCallResult.get()) {
+                synchronized (this.lock1) {
+                    if (!this.currentConnections.containsKey(numberTo) &&
+                            !this.currentConnections.containsValue(numberTo) &&
+                            !this.currentConnections.containsKey(numberFrom) &&
+                            !this.currentConnections.containsValue(numberFrom)
+                    )
+                        this.currentConnections.put(numberFrom, numberTo);
+                    this.startConnection(this.registeredPhones.get(numberFrom), numberFrom);
+                    awaitingCalls.remove(numberFrom);
+                    awaitingCalls.remove(numberTo);
+                    return true;
+                }
+            }
+        } catch (InterruptedException | ExecutionException e) {
+            e.printStackTrace();
         }
         return false;
     }
 
     @Override
     public void disconnection(String number) {
-
+        this.executorService.submit(() -> {
+            synchronized (this.lock1) {
+                if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
+                    String numberTo = this.currentConnections.get(number);
+                    this.registeredPhones.get(number).stopConnection();
+                    this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
+                    this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
+                    this.currentConnections.remove(number);
+                }
+            }
+        });
     }
 
     @Override
@@ -102,15 +133,37 @@ public class AccountingSystem implements AccountingSystemInterface {
             return Optional.of(false);
     }
 
-    class PhoneAndTime {
+    private void startConnection(Account accountFrom, String number) {
+        this.automaticDisconnectionService.submit(() -> {
+            accountFrom.startConnection();
+            while (!accountFrom.isForcefullyDisconnected() && !accountFrom.isConnectionClosed()) ;
+
+            if (accountFrom.isConnectionClosed())
+                disconnection(number);
+        });
+    }
+
+    class Account {
         private PhoneInterface phone;
         private Long remainingTime;
 
         private final Object lock;
 
-        public PhoneAndTime(PhoneInterface phone) {
+        private Thread thread;
+        private volatile long startedAt;
+        private volatile long closedAt;
+
+        private volatile boolean isForcefullyDisconnected;
+        private volatile boolean connectionClosed;
+        private volatile long currentTime;
+
+        private AtomicBoolean isRunning;
+
+        public Account(PhoneInterface phone) {
             this.phone = phone;
             this.lock = new Object();
+
+            this.isRunning = new AtomicBoolean(false);
         }
 
         public PhoneInterface getPhone() {
@@ -127,6 +180,56 @@ public class AccountingSystem implements AccountingSystemInterface {
                     this.remainingTime = 0L;
                 this.remainingTime += time;
             }
+        }
+
+        public void startConnection() {
+            this.startedAt = this.getNano();
+            this.isRunning.set(true);
+
+            synchronized (this) {
+                this.isForcefullyDisconnected = false;
+                this.closedAt = 0L;
+                this.connectionClosed = false;
+            }
+            this.thread = new Thread(() -> {
+
+                while (this.isRunning.get()) {
+                    currentTime = this.getNano();
+                    if (currentTime - startedAt >= (remainingTime)) {
+                        stopConnection();
+                        this.isForcefullyDisconnected = true;
+                    }
+                }
+            });
+            this.thread.start();
+        }
+
+        public void stopConnection() {
+            if (!isRunning.get())
+                return;
+            this.closedAt = this.getNano();
+            this.connectionClosed = true;
+            this.isRunning.set(false);
+            try {
+                this.thread.join();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            this.remainingTime = this.remainingTime - ((closedAt - startedAt));
+            if (this.remainingTime < 0L)
+                this.remainingTime = 0L;
+        }
+
+        public boolean isForcefullyDisconnected() {
+            return isForcefullyDisconnected;
+        }
+
+        public boolean isConnectionClosed() {
+            return connectionClosed;
+        }
+
+        private long getNano() {
+            return System.currentTimeMillis();
         }
     }
 }
