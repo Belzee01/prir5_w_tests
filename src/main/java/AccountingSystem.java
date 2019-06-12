@@ -1,6 +1,7 @@
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,6 +15,8 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     private ConcurrentHashMap<String, Account> registeredPhones;
     private ConcurrentHashMap<String, String> currentConnections;
+
+    private ConcurrentCallMap billing;
 
     private List<String> awaitingCalls = Collections.synchronizedList(new ArrayList<>());
 
@@ -31,6 +34,8 @@ public class AccountingSystem implements AccountingSystemInterface {
         this.executorService = Executors.newFixedThreadPool(100);
 
         this.automaticDisconnectionService = Executors.newFixedThreadPool(100);
+
+        this.billing = new ConcurrentCallMap();
 
         this.lock1 = new Object();
         this.lock2 = new Object();
@@ -92,6 +97,7 @@ public class AccountingSystem implements AccountingSystemInterface {
                     )
                         this.currentConnections.put(numberFrom, numberTo);
                     this.startConnection(this.registeredPhones.get(numberFrom), numberFrom);
+                    this.billing.put(numberFrom, numberTo);
                     awaitingCalls.remove(numberFrom);
                     awaitingCalls.remove(numberTo);
                     return true;
@@ -113,6 +119,7 @@ public class AccountingSystem implements AccountingSystemInterface {
                     this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
                     this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
                     this.currentConnections.remove(number);
+                    this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
                 }
             }
         });
@@ -120,7 +127,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public Optional<Long> getBilling(String numberFrom, String numberTo) {
-        return Optional.empty();
+        return Optional.of(this.billing.getOrDefault(numberFrom, numberTo, 0L));
     }
 
     @Override
@@ -230,6 +237,67 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         private long getNano() {
             return System.currentTimeMillis();
+        }
+    }
+
+    public static class CallHistory {
+        private String numberFrom;
+        private String numberTo;
+
+        public CallHistory(String numberFrom, String numberTo) {
+            this.numberFrom = numberFrom;
+            this.numberTo = numberTo;
+        }
+
+        public String getNumberFrom() {
+            return numberFrom;
+        }
+
+        public String getNumberTo() {
+            return numberTo;
+        }
+
+        public static CallHistory make(String numberFrom, String numberTo) {
+            return new CallHistory(numberFrom, numberTo);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CallHistory that = (CallHistory) o;
+            return Objects.equals(numberFrom, that.numberFrom) &&
+                    Objects.equals(numberTo, that.numberTo);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(numberFrom, numberTo);
+        }
+    }
+
+    class ConcurrentCallMap extends ConcurrentHashMap<CallHistory, Long> {
+        public Long getOrDefault(String numberFrom, String numberTo, Long def) {
+            CallHistory call = CallHistory.make(numberFrom, numberTo);
+            return this.getOrDefault(call, def);
+        }
+
+        public void put(String numberFrom, String numberTo) {
+            CallHistory call = CallHistory.make(numberFrom, numberTo);
+            Long currentBilling = 0L;
+            if (this.contains(call)) {
+                currentBilling = this.get(call);
+            }
+            this.putIfAbsent(call, currentBilling);
+        }
+
+        public void put(String numberFrom, String numberTo, Long duration) {
+            CallHistory call = CallHistory.make(numberFrom, numberTo);
+            Long currentBilling = 0L;
+            if (this.contains(call)) {
+                currentBilling = this.get(call);
+            }
+            this.put(call, currentBilling + duration);
         }
     }
 }
