@@ -151,6 +151,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         private Thread thread;
         private volatile long closedAt;
+        private volatile long startedAt;
         private volatile long currentTime;
 
         private AtomicBoolean isRunning;
@@ -183,29 +184,34 @@ public class AccountingSystem implements AccountingSystemInterface {
             }
             this.thread = new Thread(() -> {
 
-                long startedAt = this.getMilli();
+                this.startedAt = this.getMilli();
                 while (this.isRunning.get()) {
-                    currentTime = this.getMilli();
-                    if (currentTime - startedAt >= (remainingTime)) {
-                        this.closedAt = this.getMilli();
-                        this.isRunning.set(false);
-                    }
-                    try {
-                        Thread.sleep(10);
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
+                    this.currentTime = this.getMilli();
+                    autoDisconnectionProcess();
                 }
-                this.remainingTime = this.remainingTime - ((closedAt - startedAt));
-
-                if (this.remainingTime < 0L)
-                    this.remainingTime = 0L;
+                this.evaluateRemainingTime();
 
                 disconnection(numberFrom);
                 disconnection(numberTo);
                 this.isRunning.set(false);
             });
             this.thread.start();
+        }
+
+        private void autoDisconnectionProcess() {
+            synchronized (this) {
+                if (this.currentTime - startedAt >= (remainingTime)) {
+                    this.closedAt = this.getMilli();
+                    this.isRunning.set(false);
+                }
+            }
+        }
+
+        private void evaluateRemainingTime() {
+            this.remainingTime = this.remainingTime - ((this.closedAt - this.startedAt));
+
+            if (this.remainingTime < 0L)
+                this.remainingTime = 0L;
         }
 
         private void stopConnection() {
