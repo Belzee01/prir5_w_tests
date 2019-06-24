@@ -72,7 +72,7 @@ public class AccountingSystem implements AccountingSystemInterface {
             if (!this.registeredPhones.containsKey(numberFrom) || !this.registeredPhones.containsKey(numberTo))
                 return false;
 
-            if ( this.registeredPhones.get(numberFrom).getRemainingTime() <= 0L)
+            if (this.registeredPhones.get(numberFrom).getRemainingTime() <= 0L)
                 return false;
         }
         Future<Boolean> fromCallResult = null;
@@ -199,11 +199,9 @@ public class AccountingSystem implements AccountingSystemInterface {
         }
 
         private void autoDisconnectionProcess() {
-            synchronized (this) {
-                if (this.currentTime - startedAt >= (remainingTime)) {
-                    this.closedAt = this.getMilli();
-                    this.isRunning.set(false);
-                }
+            if (this.currentTime - startedAt >= (remainingTime)) {
+                this.closedAt = this.getMilli();
+                this.isRunning.set(false);
             }
         }
 
