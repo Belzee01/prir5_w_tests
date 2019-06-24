@@ -43,7 +43,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public void phoneRegistration(String number, PhoneInterface phone) {
-        this.registeredPhones.putIfAbsent(number, new Account(phone));
+        this.registeredPhones.put(number, new Account(phone));
     }
 
     @Override
@@ -95,7 +95,8 @@ public class AccountingSystem implements AccountingSystemInterface {
                             !this.currentConnections.containsValue(numberFrom)
                     )
                         this.currentConnections.put(numberFrom, numberTo);
-                    this.startConnection(this.registeredPhones.get(numberFrom), numberFrom);
+
+                    this.registeredPhones.get(numberFrom).startConnection(numberFrom, numberTo);
                     this.billing.put(numberFrom, numberTo);
                     awaitingCalls.remove(numberFrom);
                     awaitingCalls.remove(numberTo);
@@ -110,13 +111,17 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public void disconnection(String number) {
-        if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
-            String numberTo = this.currentConnections.get(number);
-            this.registeredPhones.get(number).stopConnection();
-            this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
-            this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
-            this.currentConnections.remove(number);
-            this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
+        synchronized (this.lock1) {
+            if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
+                String numberTo = this.currentConnections.get(number);
+                this.registeredPhones.get(number).stopConnection();
+                this.registeredPhones.get(numberTo).stopConnection();
+
+                this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
+                this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
+                this.currentConnections.remove(number);
+                this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
+            }
         }
     }
 
@@ -135,17 +140,6 @@ public class AccountingSystem implements AccountingSystemInterface {
             return Optional.of(false);
     }
 
-    private void startConnection(Account accountFrom, String number) {
-        Thread t1 = new Thread(() -> {
-            accountFrom.startConnection();
-            while (!accountFrom.isConnectionClosed()) ;
-
-            disconnection(number);
-            Thread.currentThread().interrupt();
-        });
-        t1.start();
-    }
-
     class Account {
         private PhoneInterface phone;
         private Long remainingTime;
@@ -153,10 +147,7 @@ public class AccountingSystem implements AccountingSystemInterface {
         private final Object lock;
 
         private Thread thread;
-        private volatile long startedAt;
         private volatile long closedAt;
-
-        private volatile boolean connectionClosed;
         private volatile long currentTime;
 
         private AtomicBoolean isRunning;
@@ -184,46 +175,41 @@ public class AccountingSystem implements AccountingSystemInterface {
             }
         }
 
-        public void startConnection() {
-            this.startedAt = this.getNano();
+        public void startConnection(String numberFrom, String numberTo) {
             this.isRunning.set(true);
 
             synchronized (this) {
                 this.closedAt = 0L;
-                this.connectionClosed = false;
             }
             this.thread = new Thread(() -> {
+
+                long startedAt = this.getNano();
                 while (this.isRunning.get()) {
                     currentTime = this.getNano();
                     if (currentTime - startedAt >= (remainingTime)) {
                         this.closedAt = this.getNano();
-                        this.connectionClosed = true;
                         this.isRunning.set(false);
-                        Thread.currentThread().interrupt();
+                    }
+                    try{
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
                     }
                 }
+                this.remainingTime = this.remainingTime - ((closedAt - startedAt));
+
+                if (this.remainingTime < 0L)
+                    this.remainingTime = 0L;
+
+                disconnection(numberFrom);
+                disconnection(numberTo);
+                this.isRunning.set(false);
             });
             this.thread.start();
         }
 
-        public void stopConnection() {
-            if (!isRunning.get())
-                return;
-            this.closedAt = this.getNano();
-            this.connectionClosed = true;
+        private void stopConnection() {
             this.isRunning.set(false);
-            try {
-                this.thread.join();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            this.remainingTime = this.remainingTime - ((closedAt - startedAt));
-            if (this.remainingTime < 0L)
-                this.remainingTime = 0L;
-        }
-
-        public boolean isConnectionClosed() {
-            return connectionClosed;
         }
 
         private long getNano() {
