@@ -26,6 +26,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     private final Object lock1;
     private final Object lock2;
+    private final Object lock3;
 
     public AccountingSystem() {
         this.registeredPhones = new ConcurrentHashMap<>();
@@ -39,6 +40,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         this.lock1 = new Object();
         this.lock2 = new Object();
+        this.lock3 = new Object();
     }
 
     @Override
@@ -50,17 +52,18 @@ public class AccountingSystem implements AccountingSystemInterface {
     public long subscriptionPurchase(String number, long time) {
         if (this.registeredPhones.isEmpty())
             return 0L;
-        return this.registeredPhones.computeIfPresent(number, (n, p) -> {
-            p.addTime(time);
-            return p;
-        }).getRemainingTime().orElse(0L);
+        Account account = this.registeredPhones.get(number);
+        if (account != null)
+            return account.addTime(time);
+        else
+            return 0;
     }
 
     @Override
     public Optional<Long> getRemainingTime(String number) {
         if (this.registeredPhones.isEmpty())
             return Optional.empty();
-        return this.registeredPhones.computeIfPresent(number, (n, p) -> p).getRemainingTime();
+        return Optional.ofNullable(this.registeredPhones.get(number).getRemainingTime());
     }
 
     @Override
@@ -69,7 +72,7 @@ public class AccountingSystem implements AccountingSystemInterface {
             if (!this.registeredPhones.containsKey(numberFrom) || !this.registeredPhones.containsKey(numberTo))
                 return false;
 
-            if (!this.registeredPhones.get(numberFrom).getRemainingTime().isPresent() || this.registeredPhones.get(numberFrom).getRemainingTime().get() < 0L)
+            if ( this.registeredPhones.get(numberFrom).getRemainingTime() <= 0L)
                 return false;
         }
         Future<Boolean> fromCallResult = null;
@@ -96,11 +99,13 @@ public class AccountingSystem implements AccountingSystemInterface {
                     )
                         this.currentConnections.put(numberFrom, numberTo);
 
-                    this.registeredPhones.get(numberFrom).startConnection(numberFrom, numberTo);
-                    this.billing.put(numberFrom, numberTo);
-                    awaitingCalls.remove(numberFrom);
-                    awaitingCalls.remove(numberTo);
-                    return true;
+                    synchronized (this.lock3) {
+                        this.registeredPhones.get(numberFrom).startConnection(numberFrom, numberTo);
+                        this.billing.put(numberFrom, numberTo);
+                        awaitingCalls.remove(numberFrom);
+                        awaitingCalls.remove(numberTo);
+                        return true;
+                    }
                 }
             }
         } catch (InterruptedException | ExecutionException e) {
@@ -120,7 +125,7 @@ public class AccountingSystem implements AccountingSystemInterface {
                 this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
                 this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
                 this.currentConnections.remove(number);
-                this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
+                this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime());
             }
         }
     }
@@ -144,8 +149,6 @@ public class AccountingSystem implements AccountingSystemInterface {
         private PhoneInterface phone;
         private Long remainingTime;
 
-        private final Object lock;
-
         private Thread thread;
         private volatile long closedAt;
         private volatile long currentTime;
@@ -154,8 +157,6 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         public Account(PhoneInterface phone) {
             this.phone = phone;
-            this.lock = new Object();
-
             this.isRunning = new AtomicBoolean(false);
         }
 
@@ -163,16 +164,15 @@ public class AccountingSystem implements AccountingSystemInterface {
             return phone;
         }
 
-        public Optional<Long> getRemainingTime() {
-            return Optional.ofNullable(this.remainingTime);
+        public Long getRemainingTime() {
+            return this.remainingTime;
         }
 
-        public void addTime(Long time) {
-            synchronized (this.lock) {
-                if (this.remainingTime == null)
-                    this.remainingTime = 0L;
-                this.remainingTime += time;
-            }
+        public Long addTime(Long time) {
+            if (this.remainingTime == null)
+                this.remainingTime = 0L;
+            this.remainingTime += time;
+            return this.remainingTime;
         }
 
         public void startConnection(String numberFrom, String numberTo) {
@@ -183,15 +183,15 @@ public class AccountingSystem implements AccountingSystemInterface {
             }
             this.thread = new Thread(() -> {
 
-                long startedAt = this.getNano();
+                long startedAt = this.getMilli();
                 while (this.isRunning.get()) {
-                    currentTime = this.getNano();
+                    currentTime = this.getMilli();
                     if (currentTime - startedAt >= (remainingTime)) {
-                        this.closedAt = this.getNano();
+                        this.closedAt = this.getMilli();
                         this.isRunning.set(false);
                     }
-                    try{
-                        Thread.sleep(50);
+                    try {
+                        Thread.sleep(10);
                     } catch (InterruptedException e) {
                         e.printStackTrace();
                     }
@@ -209,10 +209,11 @@ public class AccountingSystem implements AccountingSystemInterface {
         }
 
         private void stopConnection() {
+            this.closedAt = this.getMilli();
             this.isRunning.set(false);
         }
 
-        private long getNano() {
+        private long getMilli() {
             return System.currentTimeMillis();
         }
     }
