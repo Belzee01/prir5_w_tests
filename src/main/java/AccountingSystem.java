@@ -68,7 +68,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public boolean connection(String numberFrom, String numberTo) {
-        synchronized (this.lock2) {
+        synchronized (this.lock1) {
             if (!this.registeredPhones.containsKey(numberFrom) || !this.registeredPhones.containsKey(numberTo))
                 return false;
 
@@ -77,7 +77,7 @@ public class AccountingSystem implements AccountingSystemInterface {
         }
         Future<Boolean> fromCallResult = null;
 
-        synchronized (this.lock1) {
+        synchronized (this.lock2) {
             if (!this.currentConnections.containsKey(numberTo) && !this.currentConnections.containsValue(numberTo)) {
                 Callable<Boolean> fromCall = () -> this.registeredPhones.get(numberTo).getPhone().newConnection(numberFrom);
                 if (awaitingCalls.contains(numberTo) || awaitingCalls.contains(numberFrom))
@@ -91,7 +91,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         try {
             if (fromCallResult.get()) {
-                synchronized (this.lock1) {
+                synchronized (this.lock3) {
                     if (!this.currentConnections.containsKey(numberTo) &&
                             !this.currentConnections.containsValue(numberTo) &&
                             !this.currentConnections.containsKey(numberFrom) &&
@@ -99,7 +99,7 @@ public class AccountingSystem implements AccountingSystemInterface {
                     )
                         this.currentConnections.put(numberFrom, numberTo);
 
-                    synchronized (this.lock3) {
+                    synchronized (this.lock1) {
                         this.registeredPhones.get(numberFrom).startConnection(numberFrom, numberTo);
                         this.billing.put(numberFrom, numberTo);
                         awaitingCalls.remove(numberFrom);
@@ -116,7 +116,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public void disconnection(String number) {
-        synchronized (this.lock1) {
+        synchronized (this.lock2) {
             if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
                 String numberTo = this.currentConnections.get(number);
                 this.registeredPhones.get(number).stopConnection();
@@ -186,8 +186,12 @@ public class AccountingSystem implements AccountingSystemInterface {
 
                 this.startedAt = this.getMilli();
                 while (this.isRunning.get()) {
-                    this.currentTime = this.getMilli();
-                    autoDisconnectionProcess();
+                    try {
+                        this.currentTime = this.getMilli();
+                        autoDisconnectionProcess();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
                 }
                 this.evaluateRemainingTime();
 
@@ -198,11 +202,12 @@ public class AccountingSystem implements AccountingSystemInterface {
             this.thread.start();
         }
 
-        private void autoDisconnectionProcess() {
+        private void autoDisconnectionProcess() throws InterruptedException {
             if (this.currentTime - startedAt >= (remainingTime)) {
                 this.closedAt = this.getMilli();
                 this.isRunning.set(false);
             }
+            Thread.sleep(10);
         }
 
         private void evaluateRemainingTime() {
