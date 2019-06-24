@@ -7,8 +7,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class AccountingSystem implements AccountingSystemInterface {
@@ -22,8 +24,6 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     private ExecutorService executorService;
 
-    private ExecutorService automaticDisconnectionService;
-
     private final Object lock1;
     private final Object lock2;
 
@@ -31,15 +31,14 @@ public class AccountingSystem implements AccountingSystemInterface {
         this.registeredPhones = new ConcurrentHashMap<>();
         this.currentConnections = new ConcurrentHashMap<>();
 
-        this.executorService = Executors.newFixedThreadPool(100);
-
-        this.automaticDisconnectionService = Executors.newFixedThreadPool(100);
+        this.executorService = new ThreadPoolExecutor(66, 100,
+                0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>());
 
         this.billing = new ConcurrentCallMap();
 
         this.lock1 = new Object();
         this.lock2 = new Object();
-
     }
 
     @Override
@@ -111,23 +110,19 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public void disconnection(String number) {
-        this.executorService.submit(() -> {
-            synchronized (this.lock1) {
-                if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
-                    String numberTo = this.currentConnections.get(number);
-                    this.registeredPhones.get(number).stopConnection();
-                    this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
-                    this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
-                    this.currentConnections.remove(number);
-                    this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
-                }
-            }
-        });
+        if (this.currentConnections.containsKey(number) || this.currentConnections.containsValue(number)) {
+            String numberTo = this.currentConnections.get(number);
+            this.registeredPhones.get(number).stopConnection();
+            this.registeredPhones.get(number).getPhone().connectionClosed(numberTo);
+            this.registeredPhones.get(numberTo).getPhone().connectionClosed(number);
+            this.currentConnections.remove(number);
+            this.billing.put(number, numberTo, this.registeredPhones.get(number).getRemainingTime().get());
+        }
     }
 
     @Override
     public Optional<Long> getBilling(String numberFrom, String numberTo) {
-        return Optional.of(this.billing.getOrDefault(numberFrom, numberTo, 0L));
+        return Optional.ofNullable(this.billing.get(numberFrom, numberTo));
     }
 
     @Override
@@ -141,13 +136,14 @@ public class AccountingSystem implements AccountingSystemInterface {
     }
 
     private void startConnection(Account accountFrom, String number) {
-        this.automaticDisconnectionService.submit(() -> {
+        Thread t1 = new Thread(() -> {
             accountFrom.startConnection();
-            while (!accountFrom.isForcefullyDisconnected() && !accountFrom.isConnectionClosed()) ;
+            while (!accountFrom.isConnectionClosed()) ;
 
-            if (accountFrom.isConnectionClosed())
-                disconnection(number);
+            disconnection(number);
+            Thread.currentThread().interrupt();
         });
+        t1.start();
     }
 
     class Account {
@@ -160,7 +156,6 @@ public class AccountingSystem implements AccountingSystemInterface {
         private volatile long startedAt;
         private volatile long closedAt;
 
-        private volatile boolean isForcefullyDisconnected;
         private volatile boolean connectionClosed;
         private volatile long currentTime;
 
@@ -194,17 +189,17 @@ public class AccountingSystem implements AccountingSystemInterface {
             this.isRunning.set(true);
 
             synchronized (this) {
-                this.isForcefullyDisconnected = false;
                 this.closedAt = 0L;
                 this.connectionClosed = false;
             }
             this.thread = new Thread(() -> {
-
                 while (this.isRunning.get()) {
                     currentTime = this.getNano();
                     if (currentTime - startedAt >= (remainingTime)) {
-                        stopConnection();
-                        this.isForcefullyDisconnected = true;
+                        this.closedAt = this.getNano();
+                        this.connectionClosed = true;
+                        this.isRunning.set(false);
+                        Thread.currentThread().interrupt();
                     }
                 }
             });
@@ -227,10 +222,6 @@ public class AccountingSystem implements AccountingSystemInterface {
                 this.remainingTime = 0L;
         }
 
-        public boolean isForcefullyDisconnected() {
-            return isForcefullyDisconnected;
-        }
-
         public boolean isConnectionClosed() {
             return connectionClosed;
         }
@@ -247,14 +238,6 @@ public class AccountingSystem implements AccountingSystemInterface {
         public CallHistory(String numberFrom, String numberTo) {
             this.numberFrom = numberFrom;
             this.numberTo = numberTo;
-        }
-
-        public String getNumberFrom() {
-            return numberFrom;
-        }
-
-        public String getNumberTo() {
-            return numberTo;
         }
 
         public static CallHistory make(String numberFrom, String numberTo) {
@@ -277,9 +260,9 @@ public class AccountingSystem implements AccountingSystemInterface {
     }
 
     class ConcurrentCallMap extends ConcurrentHashMap<CallHistory, Long> {
-        public Long getOrDefault(String numberFrom, String numberTo, Long def) {
+        public Long get(String numberFrom, String numberTo) {
             CallHistory call = CallHistory.make(numberFrom, numberTo);
-            return this.getOrDefault(call, def);
+            return this.get(call);
         }
 
         public void put(String numberFrom, String numberTo) {
