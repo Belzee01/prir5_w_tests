@@ -3,7 +3,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -20,7 +19,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     private ConcurrentCallMap billing;
 
-    private List<String> awaitingCalls = Collections.synchronizedList(new ArrayList<>());
+    private List<String> awaitingCalls;
 
     private ExecutorService executorService;
 
@@ -31,6 +30,7 @@ public class AccountingSystem implements AccountingSystemInterface {
     public AccountingSystem() {
         this.registeredPhones = new ConcurrentHashMap<>();
         this.currentConnections = new ConcurrentHashMap<>();
+        this.awaitingCalls = Collections.synchronizedList(new ArrayList<>());
 
         this.executorService = new ThreadPoolExecutor(66, 100,
                 0L, TimeUnit.MILLISECONDS,
@@ -45,7 +45,7 @@ public class AccountingSystem implements AccountingSystemInterface {
 
     @Override
     public void phoneRegistration(String number, PhoneInterface phone) {
-        this.registeredPhones.put(number, new Account(phone));
+        this.registeredPhones.putIfAbsent(number, new Account(phone, number));
     }
 
     @Override
@@ -56,12 +56,14 @@ public class AccountingSystem implements AccountingSystemInterface {
         if (account != null)
             return account.addTime(time);
         else
-            return 0;
+            return 0L;
     }
 
     @Override
     public Optional<Long> getRemainingTime(String number) {
         if (this.registeredPhones.isEmpty())
+            return Optional.empty();
+        else if (!this.registeredPhones.containsKey(number))
             return Optional.empty();
         return Optional.ofNullable(this.registeredPhones.get(number).getRemainingTime());
     }
@@ -79,11 +81,10 @@ public class AccountingSystem implements AccountingSystemInterface {
 
         synchronized (this.lock2) {
             if (!this.currentConnections.containsKey(numberTo) && !this.currentConnections.containsValue(numberTo)) {
-                Callable<Boolean> fromCall = () -> this.registeredPhones.get(numberTo).getPhone().newConnection(numberFrom);
                 if (awaitingCalls.contains(numberTo) || awaitingCalls.contains(numberFrom))
                     return false;
 
-                fromCallResult = executorService.submit(fromCall);
+                fromCallResult = executorService.submit(() -> this.registeredPhones.get(numberTo).getPhone().newConnection(numberFrom));
                 awaitingCalls.add(numberFrom);
                 awaitingCalls.add(numberTo);
             }
@@ -100,10 +101,11 @@ public class AccountingSystem implements AccountingSystemInterface {
                         this.currentConnections.put(numberFrom, numberTo);
 
                     synchronized (this.lock1) {
-                        this.registeredPhones.get(numberFrom).startConnection(numberFrom, numberTo);
-                        this.billing.put(numberFrom, numberTo);
                         awaitingCalls.remove(numberFrom);
                         awaitingCalls.remove(numberTo);
+                        this.registeredPhones.get(numberFrom).call();
+                        this.billing.put(numberFrom, numberTo);
+
                         return true;
                     }
                 }
@@ -149,16 +151,18 @@ public class AccountingSystem implements AccountingSystemInterface {
         private PhoneInterface phone;
         private Long remainingTime;
 
-        private Thread thread;
         private volatile long closedAt;
         private volatile long startedAt;
         private volatile long currentTime;
 
+        private final String number;
+
         private AtomicBoolean isRunning;
 
-        public Account(PhoneInterface phone) {
+        public Account(PhoneInterface phone, String number) {
             this.phone = phone;
             this.isRunning = new AtomicBoolean(false);
+            this.number = number;
         }
 
         public PhoneInterface getPhone() {
@@ -176,30 +180,27 @@ public class AccountingSystem implements AccountingSystemInterface {
             return this.remainingTime;
         }
 
-        public void startConnection(String numberFrom, String numberTo) {
+        public void call() {
             this.isRunning.set(true);
 
             synchronized (this) {
                 this.closedAt = 0L;
             }
-            this.thread = new Thread(() -> {
-
+            new Thread(() -> {
                 this.startedAt = this.getMilli();
                 while (this.isRunning.get()) {
                     try {
                         this.currentTime = this.getMilli();
-                        autoDisconnectionProcess();
+                        this.autoDisconnectionProcess();
                     } catch (InterruptedException e) {
                         e.printStackTrace();
                     }
                 }
                 this.evaluateRemainingTime();
 
-                disconnection(numberFrom);
-                disconnection(numberTo);
+                disconnection(number);
                 this.isRunning.set(false);
-            });
-            this.thread.start();
+            }).start();
         }
 
         private void autoDisconnectionProcess() throws InterruptedException {
