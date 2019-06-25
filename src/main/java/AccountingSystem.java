@@ -204,7 +204,7 @@ public class AccountingSystem implements AccountingSystemInterface {
         }
 
         private void autoDisconnectionProcess() throws InterruptedException {
-            if (this.currentTime - startedAt >= (remainingTime)) {
+            if (this.currentTime - this.startedAt >= (this.remainingTime)) {
                 this.closedAt = this.getMilli();
                 this.isRunning.set(false);
             }
